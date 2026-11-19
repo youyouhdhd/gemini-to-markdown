@@ -1,8 +1,10 @@
 // ==UserScript==
-// @name         Gemini to Markdown Research Archive
+// @name         Gemini to Markdown Exporter
 // @namespace    https://github.com/faithleysath/gemini-to-markdown
-// @version      1.2.0
-// @description  Export Gemini reports to Markdown with linked citations and offline HTML previews.
+// @version      1.3.0
+// @description  Export Gemini reports, sources and Thinking to Markdown and self-contained offline HTML.
+// @updateURL    https://raw.githubusercontent.com/youyouhdhd/gemini-to-markdown/refs/heads/deep-research-archive/gemini-to-markdown.user.js
+// @downloadURL  https://raw.githubusercontent.com/youyouhdhd/gemini-to-markdown/refs/heads/deep-research-archive/gemini-to-markdown.user.js
 // @author       faithleysath
 // @match        https://gemini.google.com/*
 // @match        https://*.scf.usercontent.goog/gemini-code-immersive/shim.html*
@@ -78,6 +80,13 @@ SOFTWARE.
     return `[${label.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/[\\`*_[\]|]/g, "\\$&")}](<${url.replace(/[<>|\\]/g, encodeURIComponent)}>)`;
   }
 
+  function escapeHtml(text) {
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  const groups = [["Sources used in the report", ".used-sources"], ["Sources browsed but not used", ".unused-sources"]];
+  const ignoredTags = new Set(["SOURCES-CAROUSEL-INLINE", "SOURCES-CAROUSEL", "DEEP-RESEARCH-SOURCE-LISTS", "WEB-PREVIEW", "THINKING-PANEL", "MODEL-THOUGHTS", "BUTTON", "MAT-ICON", "STYLE", "SCRIPT", "SVG"]);
+
   function researchSources(root) {
     const owner = root.closest("response-container, .response-container-content");
     const lists = root.querySelector("deep-research-source-lists") || owner?.querySelector("deep-research-source-lists");
@@ -87,21 +96,89 @@ SOFTWARE.
       const title = link.querySelector('[data-test-id="sub-title"]')?.textContent.trim().replace(/\s+/g, " ");
       return { href: link.href, title: title || link.hostname };
     });
-    const used = read(".used-sources");
-    const unused = read(".unused-sources");
-    const appendix = [["Sources used in the report", used], ["Sources browsed but not used", unused]]
+    const sources = groups.map(([heading, selector]) => [heading, read(selector)]);
+    const appendix = sources
       .filter(([, links]) => links.length)
       .map(([heading, links]) => `## ${heading}\n\n${links.map((link, i) => `${i + 1}. ${link ? mdLink(link.title, link.href) : "Source unavailable"}`).join("\n")}`)
       .join("\n\n");
-    return { used, appendix };
+    const appendixHtml = sources.filter(([, links]) => links.length).map(([heading, links]) =>
+      `<h2>${heading}</h2><ol>${links.map((link) => `<li>${link ? `<a href="${escapeHtml(link.href)}">${escapeHtml(link.title)}</a>` : 'Source unavailable'}</li>`).join('')}</ol>`,
+    ).join('');
+    return { used: sources[0][1], appendix, appendixHtml };
   }
 
-  function previewDocument(html) {
-    const escaped = html.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  function readThinking(root) {
+    const owner = root.closest('deep-research-immersive-panel') || root.closest('response-container, .response-container, model-response') || root;
+    const markdown = [], html = [];
+    for (const item of owner.querySelectorAll('thinking-panel .item-container')) {
+      const note = item.querySelector('thought-item');
+      if (note) {
+        const title = note.querySelector('.thought-header')?.textContent.trim();
+        const text = note.querySelector('.gds-body-m.gds-italic:not(.thought-header)')?.textContent.trim();
+        if (title) {
+          markdown.push(`#### ${title.replace(/\s+/g, ' ')}`);
+          html.push(`<h4>${escapeHtml(title)}</h4>`);
+        }
+        if (text) {
+          markdown.push(text);
+          html.push(`<p>${escapeHtml(text).replace(/\r?\n/g, '<br>')}</p>`);
+        }
+      }
+      const links = Array.from(item.querySelectorAll('browse-web-chip a[data-test-id="browse-chip-link"][href]'))
+        .filter((link) => /^https?:$/.test(link.protocol))
+        .map((link) => ({
+          href: link.href,
+          title: link.querySelector('[data-test-id="title"]')?.textContent.trim().replace(/\s+/g, ' ') || link.hostname,
+        }));
+      if (links.length) {
+        markdown.push('#### Researched websites', links.map(({ title, href }) => `- ${mdLink(title, href)}`).join('\n'));
+        html.push(`<h4>Researched websites</h4><ul>${links.map(({ title, href }) => `<li><a href="${escapeHtml(href)}">${escapeHtml(title)}</a></li>`).join('')}</ul>`);
+      }
+    }
+    return { markdown: markdown.length ? ['## Thinking', ...markdown].join('\n\n') : '', html: html.length ? `<section><h2>Thinking</h2>${html.join('')}</section>` : '' };
+  }
+
+  function previewFrame(label, html) {
+    const style = '<style>html,body{overflow:auto!important}</style>';
+    const ending = /<\/head\s*>/i;
+    const scrollable = ending.test(html) ? html.replace(ending, `${style}</head>`) : `<!doctype html>${style}${html.replace(/^\s*<!doctype html\s*>/i, '')}`;
+    return `<iframe class="preview-frame" title="${escapeHtml(label)}" sandbox="allow-scripts" srcdoc="${escapeHtml(scrollable)}"></iframe>`;
+  }
+
+  function offlineHtml(title, content, css) {
     return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; form-action 'none'; base-uri 'none'; frame-src about:">
-<title>Gemini web preview</title><style>body{margin:0}iframe{display:block;border:0;width:100%;height:100vh}</style>
-<iframe title="Gemini web preview" sandbox="allow-scripts" srcdoc="${escaped}"></iframe>`;
+<title>${escapeHtml(title)}</title><style>${css}</style><body>${content}</body>`;
+  }
+
+  function archiveReportHtml(target, frames, thinking) {
+    const { used, appendixHtml } = researchSources(target);
+    const allowed = new Set('a b blockquote br caption code dd del details div dl dt em h1 h2 h3 h4 h5 h6 hr i img li ol p pre s span strong sub summary sup table tbody td th thead tfoot tr ul'.split(' '));
+    const render = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) return escapeHtml(node.textContent);
+      if (node.nodeType !== Node.ELEMENT_NODE || ignoredTags.has(node.tagName) || node.classList.contains('gemini-export-float-btn')) return '';
+      const tag = node.localName;
+      const index = node.getAttribute('data-turn-source-index');
+      if (tag === 'sup' && /^[1-9]\d*$/.test(index || '')) {
+        const source = used[Number(index) - 1];
+        const label = `[${index}]`;
+        return `<sup>${source ? `<a href="${escapeHtml(source.href)}">${label}</a>` : label}</sup>`;
+      }
+      const math = node.getAttribute('data-math');
+      if (math) return `<code>${escapeHtml(math)}</code>`;
+      const content = Array.from(node.childNodes, render).join('');
+      if (!allowed.has(tag)) return content;
+      if (tag === 'a') return /^https?:$/.test(node.protocol) ? `<a href="${escapeHtml(node.href)}">${content}</a>` : content;
+      if (tag === 'img') return `<img alt="${escapeHtml(node.alt)}" src="${escapeHtml(node.src)}">`;
+      if (tag === 'hr' || tag === 'br') return `<${tag}>`;
+      return `<${tag}>${content}</${tag}>`;
+    };
+    const title = target.querySelector('h1')?.textContent.trim() || 'Gemini report';
+    return offlineHtml(title, `<main>${render(target)}${appendixHtml}${thinking}<section><h2>Generated webpages</h2>${frames.join('')}</section></main>`, `
+:root{color-scheme:light dark;font:16px/1.65 system-ui,sans-serif}
+main{max-width:1120px;margin:auto;padding:1.5rem}a{overflow-wrap:anywhere}img{max-width:100%}
+pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #8886}
+.preview-frame{display:block;width:100%;height:80vh;border:1px solid #8886;background:white}`);
   }
 
   // A STORE-only ZIP keeps the script standalone. The bounded preview files fit in ZIP32.
@@ -155,17 +232,6 @@ SOFTWARE.
     const { used, appendix } = researchSources(rootElement);
 
     // 定义需要忽略的 UI 噪音标签 (Type 2 特有)
-    const IGNORE_TAGS = [
-      "SOURCES-CAROUSEL-INLINE",
-      "SOURCES-CAROUSEL",
-      "DEEP-RESEARCH-SOURCE-LISTS",
-      "WEB-PREVIEW",
-      "BUTTON",
-      "MAT-ICON",
-      "STYLE",
-      "SCRIPT",
-      "svg", // 通常图标 SVG 不需要转换
-    ];
 
     function traverse(node, context = {}) {
       // 1. 文本节点处理
@@ -181,7 +247,7 @@ SOFTWARE.
       const tag = node.tagName.toUpperCase();
 
       // 遇到噪音标签直接忽略
-      if (IGNORE_TAGS.includes(tag)) return "";
+      if (ignoredTags.has(tag)) return "";
 
       // 忽略 ProseMirror 的末尾占位符 (Type 1 特有)
       if (node.classList.contains("ProseMirror-trailingBreak")) return "";
@@ -225,7 +291,8 @@ SOFTWARE.
         const index = node.getAttribute("data-turn-source-index");
         if (!/^[1-9]\d*$/.test(index)) return node.textContent || "";
         const url = used[Number(index) - 1]?.href;
-        return url ? mdLink(`[${index}]`, url) : `\\[${index}\\]`;
+        const label = `&#91;${index}&#93;`;
+        return url ? `[${label}](<${url.replace(/[<>|\\]/g, encodeURIComponent)}>)` : label;
       }
 
       // 图片
@@ -628,7 +695,7 @@ SOFTWARE.
 
   async function copyToMarkdown(target, button) {
     try {
-      await navigator.clipboard.writeText(htmlToMarkdown(target));
+      await navigator.clipboard.writeText([htmlToMarkdown(target), readThinking(target).markdown].filter(Boolean).join('\n\n'));
       const label = button.querySelector("span");
       const oldLabel = label.textContent;
       label.textContent = "Copied!";
@@ -640,6 +707,7 @@ SOFTWARE.
 
   function exportToMarkdown(target) {
     const entries = [];
+    const frames = [];
     let remaining = 8000000;
     const links = Array.from(target.querySelectorAll(previewSelector), (frame, index) => {
       const label = `Gemini web preview ${index + 1}`;
@@ -649,11 +717,16 @@ SOFTWARE.
       }
       remaining -= preview.html.length;
       const path = `previews/web-preview-${index + 1}.html`;
-      entries.push([path, previewDocument(preview.html)]);
+      const rendered = previewFrame(label, preview.html);
+      entries.push([path, offlineHtml(label, rendered, 'body{margin:0}.preview-frame{display:block;border:0;width:100%;height:100vh}')]);
+      frames.push(`<h3>${label}</h3>${rendered}`);
       return `- ${mdLink(label, path)}`;
     });
-    const markdown = [htmlToMarkdown(target),
+    const thinking = readThinking(target);
+    if (frames.length) entries.push(['report.html', archiveReportHtml(target, frames, thinking.html)]);
+    const markdown = [htmlToMarkdown(target), thinking.markdown,
       links.length ? `## Generated webpages\n\n${links.join("\n")}` : "",
+      frames.length ? '[Open the offline HTML report](report.html)' : '',
     ].filter(Boolean).join("\n\n");
     const zipped = entries.length > 0;
     const blob = zipped
