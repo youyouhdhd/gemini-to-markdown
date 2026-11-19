@@ -1,8 +1,10 @@
 // ==UserScript==
 // @name         Gemini to Markdown Exporter
 // @namespace    https://github.com/faithleysath/gemini-to-markdown
-// @version      1.7.0
-// @description  Export Gemini reports, sources and Thinking to Markdown and self-contained offline HTML.
+// @version      1.8.0
+// @description  Research Archive fork. Export Gemini reports, sources, Thinking and interactive previews for offline reading.
+// @homepageURL  https://github.com/youyouhdhd/gemini-to-markdown
+// @supportURL   https://github.com/youyouhdhd/gemini-to-markdown/issues
 // @updateURL    https://raw.githubusercontent.com/youyouhdhd/gemini-to-markdown/refs/heads/deep-research-archive/gemini-to-markdown.user.js
 // @downloadURL  https://raw.githubusercontent.com/youyouhdhd/gemini-to-markdown/refs/heads/deep-research-archive/gemini-to-markdown.user.js
 // @author       faithleysath
