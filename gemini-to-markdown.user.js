@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini to Markdown Exporter
 // @namespace    https://github.com/faithleysath/gemini-to-markdown
-// @version      1.4.0
+// @version      1.5.0
 // @description  Export Gemini reports, sources and Thinking to Markdown and self-contained offline HTML.
 // @updateURL    https://raw.githubusercontent.com/youyouhdhd/gemini-to-markdown/refs/heads/deep-research-archive/gemini-to-markdown.user.js
 // @downloadURL  https://raw.githubusercontent.com/youyouhdhd/gemini-to-markdown/refs/heads/deep-research-archive/gemini-to-markdown.user.js
@@ -186,14 +186,46 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
 .preview-frame{display:block;width:100%;height:80vh;border:1px solid #8886;background:white}`);
   }
 
+  function exportTime(instant) {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23', timeZoneName: 'longOffset',
+    }).formatToParts(instant);
+    const { year, month, day, hour, minute, second, timeZoneName } = Object.fromEntries(
+      parts.map(({ type, value }) => [type, value]),
+    );
+    const zone = timeZoneName === 'GMT' ? 'UTC+0000' : timeZoneName.replace('GMT', 'UTC').replace(':', '');
+    return {
+      filename: `${year}-${month}-${day}_${hour}-${minute}-${second}_${zone}`,
+      dosDate: (Number(year) - 1980) * 512 + Number(month) * 32 + Number(day),
+      dosTime: Number(hour) * 2048 + Number(minute) * 32 + Math.floor(Number(second) / 2),
+      unixSeconds: Math.floor(instant.getTime() / 1000),
+      fileTime: BigInt(instant.getTime()) * 10000n + 116444736000000000n,
+    };
+  }
+
   // A STORE-only ZIP keeps the script standalone. The bounded preview files fit in ZIP32.
-  function archive(entries) {
+  function archive(entries, stamp) {
     const local = [], central = [];
     const encoder = new TextEncoder();
     let offset = 0, centralSize = 0;
     const ints = (length) => new DataView(new ArrayBuffer(length));
     const word = (view, at, value) => view.setUint16(at, value, true);
     const dword = (view, at, value) => view.setUint32(at, value, true);
+    // NTFS preserves creation time. The Unix field carries modification time for other readers.
+    const hasUnixTime = stamp.unixSeconds <= 0x7fffffff;
+    const timeExtra = ints(hasUnixTime ? 45 : 36);
+    word(timeExtra, 0, 0x000a);
+    word(timeExtra, 2, 32);
+    word(timeExtra, 8, 1);
+    word(timeExtra, 10, 24);
+    for (const at of [12, 20, 28]) timeExtra.setBigUint64(at, stamp.fileTime, true);
+    if (hasUnixTime) {
+      word(timeExtra, 36, 0x5455);
+      word(timeExtra, 38, 5);
+      timeExtra.setUint8(40, 1);
+      dword(timeExtra, 41, stamp.unixSeconds);
+    }
     for (const [name, content] of entries) {
       const filename = encoder.encode(name), bytes = encoder.encode(content);
       let crc = -1;
@@ -205,19 +237,21 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
       dword(a, 0, 0x04034b50);
       word(a, 4, 20);
       word(a, 6, 0x800);
-      word(a, 12, 33);
+      word(a, 10, stamp.dosTime);
+      word(a, 12, stamp.dosDate);
       dword(a, 14, ~crc);
       dword(a, 18, bytes.length);
       dword(a, 22, bytes.length);
       word(a, 26, filename.length);
+      word(a, 28, timeExtra.byteLength);
       dword(b, 0, 0x02014b50);
       word(b, 4, 20);
       new Uint8Array(b.buffer, 6, 26).set(new Uint8Array(a.buffer, 4, 26));
       dword(b, 42, offset);
-      local.push(a.buffer, filename, bytes);
-      central.push(b.buffer, filename);
-      offset += a.byteLength + filename.length + bytes.length;
-      centralSize += b.byteLength + filename.length;
+      local.push(a.buffer, filename, timeExtra.buffer, bytes);
+      central.push(b.buffer, filename, timeExtra.buffer);
+      offset += a.byteLength + filename.length + timeExtra.byteLength + bytes.length;
+      centralSize += b.byteLength + filename.length + timeExtra.byteLength;
     }
     const end = ints(22);
     dword(end, 0, 0x06054b50);
@@ -251,8 +285,8 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
 
       const tag = node.tagName.toUpperCase();
       if (tag === 'WEB-PREVIEW') {
-        const links = positions?.get(node)?.map((preview) => preview.link).join('\n\n');
-        return links ? `\n\n${links}\n\n` : '';
+        const markdown = positions?.get(node)?.map((preview) => preview.markdown).join('\n\n');
+        return markdown ? `\n\n${markdown}\n\n` : '';
       }
 
       // 遇到噪音标签直接忽略
@@ -715,6 +749,7 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
   }
 
   function exportToMarkdown(target) {
+    const stamp = exportTime(new Date());
     const entries = [];
     const positions = new Map();
     let remaining = 8000000;
@@ -725,14 +760,19 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
       const preview = previews.get(frame);
       const label = preview?.html.match(/<title\b[^>]*>([^<]*)<\/title>/i)?.[1]?.trim().slice(0, 200) || `Gemini web preview ${index + 1}`;
       if (preview?.url !== frame.src || preview.html.length > remaining) {
-        slots.push({ link: `${label} (web preview unavailable)`, html: `<p>${escapeHtml(label)} (web preview unavailable)</p>` });
+        slots.push({ markdown: `${label} (web preview unavailable)`, html: `<p>${escapeHtml(label)} (web preview unavailable)</p>` });
         return;
       }
       remaining -= preview.html.length;
       const path = `previews/web-preview-${index + 1}.html`;
       const rendered = previewFrame(label, preview.html);
       entries.push([path, offlineHtml(label, rendered, 'body{margin:0}.preview-frame{display:block;border:0;width:100%;height:100vh}')]);
-      slots.push({ link: mdLink(label, path), html: `<figure class="web-preview"><figcaption>${escapeHtml(label)}</figcaption>${rendered}</figure>` });
+      // Readers that impose a stricter sandbox leave the fallback link visible.
+      const fallbackStyle = entries.length === 1
+        ? '<style>iframe.gemini-web-preview:not([sandbox~="allow-scripts"]){display:none}</style>\n\n'
+        : '';
+      const inline = `<iframe class="gemini-web-preview" src="${path}" title="${escapeHtml(label.replace(/\s+/g, ' '))}" sandbox="allow-scripts" width="100%" height="600" loading="lazy"></iframe>`;
+      slots.push({ markdown: `${fallbackStyle}${inline}\n\n${mdLink(label, path)}`, html: `<figure class="web-preview"><figcaption>${escapeHtml(label)}</figcaption>${rendered}</figure>` });
     });
     const thinking = readThinking(target);
     const zipped = entries.length > 0;
@@ -741,15 +781,14 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
       zipped ? '[Open the offline HTML report](report.html)' : '',
     ].filter(Boolean).join("\n\n");
     const blob = zipped
-      ? archive([["report.md", markdown], ...entries])
+      ? archive([["report.md", markdown], ...entries], stamp)
       : new Blob([markdown], { type: "text/markdown;charset=utf-8" });
     const url = URL.createObjectURL(blob);
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const a = document.createElement("a");
     a.href = url;
     const rawTitle = document.title.replace(/(?:^|\s*[-–—|]\s*)(?:Google Gemini|Gemini)\s*$/i, '').trim() || target.querySelector('h1')?.textContent?.trim();
     const title = Array.from(rawTitle || '').slice(0, 50).join('').replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-').replace(/[. ]+$/, '').trim();
-    a.download = `${title ? `${title}__` : ''}gemini_export_${timestamp}.${zipped ? "zip" : "md"}`;
+    a.download = `${title ? `${title}__` : ''}gemini_export_${stamp.filename}.${zipped ? "zip" : "md"}`;
     document.body.appendChild(a);
     a.click();
     a.remove();
