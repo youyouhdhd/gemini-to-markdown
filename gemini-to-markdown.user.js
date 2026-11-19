@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini to Markdown Exporter
 // @namespace    https://github.com/faithleysath/gemini-to-markdown
-// @version      1.6.0
+// @version      1.7.0
 // @description  Export Gemini reports, sources and Thinking to Markdown and self-contained offline HTML.
 // @updateURL    https://raw.githubusercontent.com/youyouhdhd/gemini-to-markdown/refs/heads/deep-research-archive/gemini-to-markdown.user.js
 // @downloadURL  https://raw.githubusercontent.com/youyouhdhd/gemini-to-markdown/refs/heads/deep-research-archive/gemini-to-markdown.user.js
@@ -759,70 +759,110 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
     }
   }
 
-  function captureWithin(promise) {
-    let timer;
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Preview capture timed out')), 4000);
-    });
-    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  const FRAME_POLICY = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; form-action 'none'; base-uri 'none'";
+  const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
+  // This function runs inside an opaque iframe and must have no module dependencies.
+  function rasterizePreview(targetOrigin, maxBytes) {
+      document.addEventListener('DOMContentLoaded', () => {
+          window.setTimeout(async () => {
+              const reply = (image) => window.top?.postMessage(image, targetOrigin, image ? [image] : []);
+              try {
+                  const { body, documentElement: root } = document;
+                  const width = window.innerWidth;
+                  const height = Math.min(6000, Math.max(body.scrollHeight, root.scrollHeight));
+                  const clone = root.cloneNode(true);
+                  const sourceCanvases = root.querySelectorAll('canvas');
+                  clone.querySelectorAll('canvas').forEach((canvas, index) => {
+                      const image = document.createElement('img');
+                      for (const attr of canvas.getAttributeNames())
+                          image.setAttribute(attr, canvas.getAttribute(attr) ?? '');
+                      try {
+                          image.src = sourceCanvases[index].toDataURL();
+                          canvas.replaceWith(image);
+                      }
+                      catch {
+                          canvas.remove();
+                      }
+                  });
+                  clone
+                      .querySelectorAll('meta, link, script, iframe, object, embed, noscript, title')
+                      .forEach((element) => element.remove());
+                  const style = document.createElement('style');
+                  style.textContent =
+                      'html,body{overflow:visible!important}*,*::before,*::after{animation:none!important;transition:none!important}';
+                  clone.querySelector('head')?.append(style);
+                  const markup = new XMLSerializer().serializeToString(clone);
+                  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><foreignObject width="100%" height="100%">${markup}</foreignObject></svg>`;
+                  const image = new Image();
+                  image.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+                  await image.decode();
+                  const scale = Math.min(2, Math.sqrt(10_000_000 / (width * height)));
+                  const canvas = document.createElement('canvas');
+                  canvas.width = Math.floor(width * scale);
+                  canvas.height = Math.floor(height * scale);
+                  const context = canvas.getContext('2d');
+                  if (!context)
+                      return reply(null);
+                  context.fillStyle = 'white';
+                  context.fillRect(0, 0, canvas.width, canvas.height);
+                  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+                  // Canvas.toBlob can defer encoding while Chrome is idle-throttling this offscreen frame.
+                  const encoded = canvas.toDataURL('image/png').split(',', 2)[1];
+                  if (!encoded || encoded.length > Math.ceil(maxBytes / 3) * 4)
+                      return reply(null);
+                  const binary = atob(encoded);
+                  const png = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+                  reply(png.byteLength <= maxBytes ? png.buffer : null);
+              }
+              catch {
+                  reply(null);
+              }
+          }, 150);
+      }, { once: true });
   }
-
-  async function capturePreviewScreenshots(frames, save) {
-    const media = navigator.mediaDevices;
-    if (!frames.size || !media?.setCaptureHandleConfig || !media.getDisplayMedia) return;
-    let stream;
-    const video = document.createElement('video');
-    video.muted = true;
-    const scroll = new Map();
-    const handle = crypto.randomUUID();
-    let handleConfigured = false;
-    try {
-      media.setCaptureHandleConfig({ handle, permittedOrigins: [location.origin] });
-      handleConfigured = true;
-      stream = await media.getDisplayMedia({
-        audio: false, video: { displaySurface: 'browser' }, preferCurrentTab: true,
-        surfaceSwitching: 'exclude', monitorTypeSurfaces: 'exclude',
+  function renderGeminiPreviewImage(html) {
+      return new Promise((resolve) => {
+          const outer = document.createElement('iframe');
+          outer.setAttribute('sandbox', 'allow-scripts');
+          outer.setAttribute('aria-hidden', 'true');
+          outer.tabIndex = -1;
+          outer.style.cssText =
+              'position:fixed;left:-12000px;top:0;width:1120px;height:760px;border:0;pointer-events:none';
+          const inner = document.createElement('iframe');
+          inner.setAttribute('sandbox', 'allow-scripts');
+          inner.style.cssText = 'display:block;width:100%;height:760px;border:0';
+          const source = html
+              .replace(/^\s*<!doctype[^>]*>/i, '')
+              .replace(/<script\b[^>]*\bdata-bard-client-injected\b[^>]*>[\s\S]*?<\/script\s*>/gi, '');
+          const finish = (image) => {
+              window.clearTimeout(timer);
+              window.removeEventListener('message', receive);
+              outer.remove();
+              resolve(image);
+          };
+          const receive = (event) => {
+              if (event.origin !== 'null' || event.source !== outer.contentWindow?.[0])
+                  return;
+              const data = event.data;
+              if (!(data instanceof ArrayBuffer) ||
+                  data.byteLength < 8 ||
+                  data.byteLength > MAX_IMAGE_BYTES)
+                  return finish();
+              const signature = new DataView(data).getBigUint64(0);
+              finish(signature === 0x89504e470d0a1a0an ? new Uint8Array(data) : undefined);
+          };
+          const timer = window.setTimeout(finish, 4500);
+          window.addEventListener('message', receive);
+          try {
+              inner.srcdoc = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${FRAME_POLICY}; frame-src 'none'"><script>(${rasterizePreview.toString()})(${JSON.stringify(location.origin)},${MAX_IMAGE_BYTES});</script>${source}`;
+              // The outer policy also blocks navigation attempts from the generated inner document.
+              outer.srcdoc = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${FRAME_POLICY}; frame-src about:"><style>body{margin:0}</style>${inner.outerHTML}`;
+              document.body.append(outer);
+          }
+          catch {
+              finish();
+          }
       });
-      const [track] = stream.getVideoTracks();
-      // Accept pixels only from this tab, even if other Gemini tabs have the same title.
-      if (track?.getCaptureHandle?.()?.handle !== handle) return;
-      video.srcObject = stream;
-      await captureWithin(video.play());
-      for (const frame of frames.keys()) {
-        if (!frame.isConnected || !frame.getClientRects().length || track.readyState !== 'live') continue;
-        for (let node = frame.parentElement; node; node = node.parentElement) {
-          if (!scroll.has(node)) scroll.set(node, [node.scrollLeft, node.scrollTop]);
-        }
-        frame.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
-        // Let the scroll reach Chrome's tab video stream before cropping the next chart.
-        await new Promise((resolve) => setTimeout(resolve, 240));
-        if (track.readyState !== 'live' || !frame.isConnected || document.hidden) break;
-        const rect = frame.getBoundingClientRect();
-        const scaleX = video.videoWidth / innerWidth;
-        const scaleY = video.videoHeight / innerHeight;
-        const left = Math.max(0, rect.left);
-        const top = Math.max(0, rect.top);
-        const width = (Math.min(innerWidth, rect.right) - left) * scaleX;
-        const height = (Math.min(innerHeight, rect.bottom) - top) * scaleY;
-        if (width <= 0 || height <= 0) continue;
-        const scale = Math.min(1, 1600 / Math.max(width, height));
-        const canvas = document.createElement('canvas');
-        canvas.width = Math.round(width * scale);
-        canvas.height = Math.round(height * scale);
-        const context = canvas.getContext('2d');
-        if (!context || !canvas.width || !canvas.height) continue;
-        context.drawImage(video, left * scaleX, top * scaleY, width, height, 0, 0, canvas.width, canvas.height);
-        const png = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
-        if (png) save(frame, new Uint8Array(await png.arrayBuffer()));
-      }
-    } catch (error) {
-      if (error?.name !== 'NotAllowedError') console.warn('Gemini preview screenshot unavailable:', error);
-    } finally {
-      video.srcObject = null;
-      stream?.getTracks().forEach((track) => track.stop());
-      for (const [node, [left, top]] of scroll) node.scrollTo({ left, top, behavior: 'instant' });
-      if (handleConfigured) media.setCaptureHandleConfig({});
-    }
   }
 
   async function exportToMarkdown(target) {
@@ -830,7 +870,7 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
     const sourceUrl = location.href;
     const entries = [];
     const positions = new Map();
-    const captureSlots = new Map();
+    const previewImages = [];
     let remaining = 8000000;
     Array.from(target.querySelectorAll(previewSelector)).forEach((frame, index) => {
       const host = frame.closest('web-preview');
@@ -846,19 +886,21 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
       const path = `previews/web-preview-${index + 1}.html`;
       const rendered = previewFrame(label, preview.html);
       entries.push([path, offlineHtml(label, rendered, 'body{margin:0}.preview-frame{display:block;border:0;width:100%;height:100vh}')]);
-      const slot = { markdown: mdLink(label, path), html: `<figure class="web-preview"><figcaption>${escapeHtml(label)}</figcaption>${rendered}</figure>` };
+      const slot = { markdown: mdLink(label + " · Interactive HTML", path), html: `<figure class="web-preview"><figcaption>${escapeHtml(label)}</figcaption>${rendered}</figure>` };
       slots.push(slot);
-      captureSlots.set(frame, { slot, path, label });
+      previewImages.push({ slot, path, label, source: preview.html });
     });
-    let screenshotBytes = 16 * 1024 * 1024;
-    await capturePreviewScreenshots(captureSlots, (frame, bytes) => {
-      const entry = captureSlots.get(frame);
-      if (!entry || bytes.byteLength > screenshotBytes) return;
-      screenshotBytes -= bytes.byteLength;
-      const imagePath = entry.path.replace(/\.html$/, '.png');
+    let imageBytes = 16 * 1024 * 1024;
+    const deadline = Date.now() + 15000;
+    for (const { slot, path, label, source } of previewImages) {
+      if (imageBytes <= 0 || Date.now() >= deadline || location.href !== sourceUrl) break;
+      const bytes = await renderGeminiPreviewImage(source);
+      if (!bytes || bytes.byteLength > imageBytes) continue;
+      imageBytes -= bytes.byteLength;
+      const imagePath = path.replace(/\.html$/, '.png');
       entries.push([imagePath, bytes]);
-      entry.slot.markdown = `[!${mdLink(entry.label, imagePath)}](<${entry.path}>)`;
-    });
+      slot.markdown = `[!${mdLink(label, imagePath)}](<${path}>)\n\n${slot.markdown}`;
+    }
     if (location.href !== sourceUrl || !target.isConnected) return;
     const thinking = readThinking(target);
     const zipped = entries.length > 0;
