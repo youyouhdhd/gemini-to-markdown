@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini to Markdown Exporter
 // @namespace    https://github.com/faithleysath/gemini-to-markdown
-// @version      1.3.0
+// @version      1.3.1
 // @description  Export Gemini reports, sources and Thinking to Markdown and self-contained offline HTML.
 // @updateURL    https://raw.githubusercontent.com/youyouhdhd/gemini-to-markdown/refs/heads/deep-research-archive/gemini-to-markdown.user.js
 // @downloadURL  https://raw.githubusercontent.com/youyouhdhd/gemini-to-markdown/refs/heads/deep-research-archive/gemini-to-markdown.user.js
@@ -141,7 +141,8 @@ SOFTWARE.
   function previewFrame(label, html) {
     const style = '<style>html,body{overflow:auto!important}</style>';
     const ending = /<\/head\s*>/i;
-    const scrollable = ending.test(html) ? html.replace(ending, `${style}</head>`) : `<!doctype html>${style}${html.replace(/^\s*<!doctype html\s*>/i, '')}`;
+    const source = html.replace(/<script\b[^>]*\bdata-bard-client-injected\b[^>]*>[\s\S]*?<\/script\s*>/gi, '');
+    const scrollable = ending.test(source) ? source.replace(ending, `${style}</head>`) : `<!doctype html>${style}${source.replace(/^\s*<!doctype html\s*>/i, '')}`;
     return `<iframe class="preview-frame" title="${escapeHtml(label)}" sandbox="allow-scripts" srcdoc="${escapeHtml(scrollable)}"></iframe>`;
   }
 
