@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini to Markdown Exporter
 // @namespace    https://github.com/faithleysath/gemini-to-markdown
-// @version      1.3.1
+// @version      1.4.0
 // @description  Export Gemini reports, sources and Thinking to Markdown and self-contained offline HTML.
 // @updateURL    https://raw.githubusercontent.com/youyouhdhd/gemini-to-markdown/refs/heads/deep-research-archive/gemini-to-markdown.user.js
 // @downloadURL  https://raw.githubusercontent.com/youyouhdhd/gemini-to-markdown/refs/heads/deep-research-archive/gemini-to-markdown.user.js
@@ -77,7 +77,8 @@ SOFTWARE.
   });
 
   function mdLink(label, url) {
-    return `[${label.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/[\\`*_[\]|]/g, "\\$&")}](<${url.replace(/[<>|\\]/g, encodeURIComponent)}>)`;
+    const text = escapeHtml(label).replace(/[\\`*_|]/g, "\\$&").replace(/\[/g, '&#91;').replace(/\]/g, '&#93;');
+    return `[${text}](<${url.replace(/[<>|\\]/g, encodeURIComponent)}>)`;
   }
 
   function escapeHtml(text) {
@@ -152,12 +153,14 @@ SOFTWARE.
 <title>${escapeHtml(title)}</title><style>${css}</style><body>${content}</body>`;
   }
 
-  function archiveReportHtml(target, frames, thinking) {
+  function archiveReportHtml(target, positions, thinking) {
     const { used, appendixHtml } = researchSources(target);
     const allowed = new Set('a b blockquote br caption code dd del details div dl dt em h1 h2 h3 h4 h5 h6 hr i img li ol p pre s span strong sub summary sup table tbody td th thead tfoot tr ul'.split(' '));
     const render = (node) => {
       if (node.nodeType === Node.TEXT_NODE) return escapeHtml(node.textContent);
-      if (node.nodeType !== Node.ELEMENT_NODE || ignoredTags.has(node.tagName) || node.classList.contains('gemini-export-float-btn')) return '';
+      if (node.nodeType !== Node.ELEMENT_NODE) return '';
+      if (node.localName === 'web-preview') return positions.get(node)?.map((preview) => preview.html).join('') || '';
+      if (ignoredTags.has(node.tagName) || node.classList.contains('gemini-export-float-btn')) return '';
       const tag = node.localName;
       const index = node.getAttribute('data-turn-source-index');
       if (tag === 'sup' && /^[1-9]\d*$/.test(index || '')) {
@@ -175,10 +178,11 @@ SOFTWARE.
       return `<${tag}>${content}</${tag}>`;
     };
     const title = target.querySelector('h1')?.textContent.trim() || 'Gemini report';
-    return offlineHtml(title, `<main>${render(target)}${appendixHtml}${thinking}<section><h2>Generated webpages</h2>${frames.join('')}</section></main>`, `
+    return offlineHtml(title, `<main>${render(target)}${appendixHtml}${thinking}</main>`, `
 :root{color-scheme:light dark;font:16px/1.65 system-ui,sans-serif}
 main{max-width:1120px;margin:auto;padding:1.5rem}a{overflow-wrap:anywhere}img{max-width:100%}
 pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #8886}
+.web-preview{margin:1.5rem 0}.web-preview figcaption{margin-bottom:.4rem;font-weight:600}
 .preview-frame{display:block;width:100%;height:80vh;border:1px solid #8886;background:white}`);
   }
 
@@ -228,7 +232,7 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
   }
   // === 终极通用版：HTML 转 Markdown ===
   // 兼容：ProseMirror 编辑器、Angular 前端、常见 AI 对话界面
-  function htmlToMarkdown(rootElement) {
+  function htmlToMarkdown(rootElement, positions) {
     if (!rootElement) return "";
     const { used, appendix } = researchSources(rootElement);
 
@@ -246,6 +250,10 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
       if (node.nodeType !== Node.ELEMENT_NODE) return "";
 
       const tag = node.tagName.toUpperCase();
+      if (tag === 'WEB-PREVIEW') {
+        const links = positions?.get(node)?.map((preview) => preview.link).join('\n\n');
+        return links ? `\n\n${links}\n\n` : '';
+      }
 
       // 遇到噪音标签直接忽略
       if (ignoredTags.has(tag)) return "";
@@ -292,7 +300,7 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
         const index = node.getAttribute("data-turn-source-index");
         if (!/^[1-9]\d*$/.test(index)) return node.textContent || "";
         const url = used[Number(index) - 1]?.href;
-        const label = `&#91;${index}&#93;`;
+        const label = `[${index}]`;
         return url ? `[${label}](<${url.replace(/[<>|\\]/g, encodeURIComponent)}>)` : label;
       }
 
@@ -708,28 +716,30 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
 
   function exportToMarkdown(target) {
     const entries = [];
-    const frames = [];
+    const positions = new Map();
     let remaining = 8000000;
-    const links = Array.from(target.querySelectorAll(previewSelector), (frame, index) => {
-      const label = `Gemini web preview ${index + 1}`;
+    Array.from(target.querySelectorAll(previewSelector)).forEach((frame, index) => {
+      const host = frame.closest('web-preview');
+      if (!positions.has(host)) positions.set(host, []);
+      const slots = positions.get(host);
       const preview = previews.get(frame);
+      const label = preview?.html.match(/<title\b[^>]*>([^<]*)<\/title>/i)?.[1]?.trim().slice(0, 200) || `Gemini web preview ${index + 1}`;
       if (preview?.url !== frame.src || preview.html.length > remaining) {
-        return `- ${label} (unavailable; reload Gemini with the userscript active)`;
+        slots.push({ link: `${label} (web preview unavailable)`, html: `<p>${escapeHtml(label)} (web preview unavailable)</p>` });
+        return;
       }
       remaining -= preview.html.length;
       const path = `previews/web-preview-${index + 1}.html`;
       const rendered = previewFrame(label, preview.html);
       entries.push([path, offlineHtml(label, rendered, 'body{margin:0}.preview-frame{display:block;border:0;width:100%;height:100vh}')]);
-      frames.push(`<h3>${label}</h3>${rendered}`);
-      return `- ${mdLink(label, path)}`;
+      slots.push({ link: mdLink(label, path), html: `<figure class="web-preview"><figcaption>${escapeHtml(label)}</figcaption>${rendered}</figure>` });
     });
     const thinking = readThinking(target);
-    if (frames.length) entries.push(['report.html', archiveReportHtml(target, frames, thinking.html)]);
-    const markdown = [htmlToMarkdown(target), thinking.markdown,
-      links.length ? `## Generated webpages\n\n${links.join("\n")}` : "",
-      frames.length ? '[Open the offline HTML report](report.html)' : '',
-    ].filter(Boolean).join("\n\n");
     const zipped = entries.length > 0;
+    if (zipped) entries.push(['report.html', archiveReportHtml(target, positions, thinking.html)]);
+    const markdown = [htmlToMarkdown(target, positions), thinking.markdown,
+      zipped ? '[Open the offline HTML report](report.html)' : '',
+    ].filter(Boolean).join("\n\n");
     const blob = zipped
       ? archive([["report.md", markdown], ...entries])
       : new Blob([markdown], { type: "text/markdown;charset=utf-8" });
@@ -737,7 +747,9 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `gemini_export_${timestamp}.${zipped ? "zip" : "md"}`;
+    const rawTitle = document.title.replace(/(?:^|\s*[-–—|]\s*)(?:Google Gemini|Gemini)\s*$/i, '').trim() || target.querySelector('h1')?.textContent?.trim();
+    const title = Array.from(rawTitle || '').slice(0, 50).join('').replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-').replace(/[. ]+$/, '').trim();
+    a.download = `${title ? `${title}__` : ''}gemini_export_${timestamp}.${zipped ? "zip" : "md"}`;
     document.body.appendChild(a);
     a.click();
     a.remove();
