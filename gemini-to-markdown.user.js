@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini to Markdown Exporter
 // @namespace    https://github.com/faithleysath/gemini-to-markdown
-// @version      1.5.0
+// @version      1.6.0
 // @description  Export Gemini reports, sources and Thinking to Markdown and self-contained offline HTML.
 // @updateURL    https://raw.githubusercontent.com/youyouhdhd/gemini-to-markdown/refs/heads/deep-research-archive/gemini-to-markdown.user.js
 // @downloadURL  https://raw.githubusercontent.com/youyouhdhd/gemini-to-markdown/refs/heads/deep-research-archive/gemini-to-markdown.user.js
@@ -66,6 +66,7 @@ SOFTWARE.
 
   if (location.origin !== geminiOrigin || window.parent !== window) return;
   const previews = new WeakMap();
+  let exporting = false;
   window.addEventListener("message", (event) => {
     const { type, html } = event.data || {};
     if (type !== previewMessage || typeof html !== "string" || !html.length || html.length > maxPreviewSize) return;
@@ -189,14 +190,13 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
   function exportTime(instant) {
     const parts = new Intl.DateTimeFormat('en-CA', {
       year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23', timeZoneName: 'longOffset',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
     }).formatToParts(instant);
-    const { year, month, day, hour, minute, second, timeZoneName } = Object.fromEntries(
+    const { year, month, day, hour, minute, second } = Object.fromEntries(
       parts.map(({ type, value }) => [type, value]),
     );
-    const zone = timeZoneName === 'GMT' ? 'UTC+0000' : timeZoneName.replace('GMT', 'UTC').replace(':', '');
     return {
-      filename: `${year}-${month}-${day}_${hour}-${minute}-${second}_${zone}`,
+      filename: `${year}-${month}-${day}_${hour}-${minute}-${second}`,
       dosDate: (Number(year) - 1980) * 512 + Number(month) * 32 + Number(day),
       dosTime: Number(hour) * 2048 + Number(minute) * 32 + Math.floor(Number(second) / 2),
       unixSeconds: Math.floor(instant.getTime() / 1000),
@@ -227,7 +227,8 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
       dword(timeExtra, 41, stamp.unixSeconds);
     }
     for (const [name, content] of entries) {
-      const filename = encoder.encode(name), bytes = encoder.encode(content);
+      const filename = encoder.encode(name);
+      const bytes = typeof content === 'string' ? encoder.encode(content) : content;
       let crc = -1;
       for (const byte of bytes) {
         crc ^= byte;
@@ -724,10 +725,20 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
     });
 
     // 点击事件 - 执行导出
-    exportBtn.addEventListener('click', (e) => {
+    exportBtn.addEventListener('click', async (e) => {
       e.preventDefault();
       e.stopPropagation();
-      exportToMarkdown(container);
+      if (exporting) return;
+      exporting = true;
+      exportBtn.disabled = true;
+      try {
+        await exportToMarkdown(container);
+      } catch (error) {
+        console.error('Gemini Markdown export failed:', error);
+      } finally {
+        exporting = false;
+        exportBtn.disabled = false;
+      }
     });
 
     buttonContainer.appendChild(copyBtn);
@@ -748,10 +759,78 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
     }
   }
 
-  function exportToMarkdown(target) {
+  function captureWithin(promise) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Preview capture timed out')), 4000);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  }
+
+  async function capturePreviewScreenshots(frames, save) {
+    const media = navigator.mediaDevices;
+    if (!frames.size || !media?.setCaptureHandleConfig || !media.getDisplayMedia) return;
+    let stream;
+    const video = document.createElement('video');
+    video.muted = true;
+    const scroll = new Map();
+    const handle = crypto.randomUUID();
+    let handleConfigured = false;
+    try {
+      media.setCaptureHandleConfig({ handle, permittedOrigins: [location.origin] });
+      handleConfigured = true;
+      stream = await media.getDisplayMedia({
+        audio: false, video: { displaySurface: 'browser' }, preferCurrentTab: true,
+        surfaceSwitching: 'exclude', monitorTypeSurfaces: 'exclude',
+      });
+      const [track] = stream.getVideoTracks();
+      // Accept pixels only from this tab, even if other Gemini tabs have the same title.
+      if (track?.getCaptureHandle?.()?.handle !== handle) return;
+      video.srcObject = stream;
+      await captureWithin(video.play());
+      for (const frame of frames.keys()) {
+        if (!frame.isConnected || !frame.getClientRects().length || track.readyState !== 'live') continue;
+        for (let node = frame.parentElement; node; node = node.parentElement) {
+          if (!scroll.has(node)) scroll.set(node, [node.scrollLeft, node.scrollTop]);
+        }
+        frame.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+        // Let the scroll reach Chrome's tab video stream before cropping the next chart.
+        await new Promise((resolve) => setTimeout(resolve, 240));
+        if (track.readyState !== 'live' || !frame.isConnected || document.hidden) break;
+        const rect = frame.getBoundingClientRect();
+        const scaleX = video.videoWidth / innerWidth;
+        const scaleY = video.videoHeight / innerHeight;
+        const left = Math.max(0, rect.left);
+        const top = Math.max(0, rect.top);
+        const width = (Math.min(innerWidth, rect.right) - left) * scaleX;
+        const height = (Math.min(innerHeight, rect.bottom) - top) * scaleY;
+        if (width <= 0 || height <= 0) continue;
+        const scale = Math.min(1, 1600 / Math.max(width, height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(width * scale);
+        canvas.height = Math.round(height * scale);
+        const context = canvas.getContext('2d');
+        if (!context || !canvas.width || !canvas.height) continue;
+        context.drawImage(video, left * scaleX, top * scaleY, width, height, 0, 0, canvas.width, canvas.height);
+        const png = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+        if (png) save(frame, new Uint8Array(await png.arrayBuffer()));
+      }
+    } catch (error) {
+      if (error?.name !== 'NotAllowedError') console.warn('Gemini preview screenshot unavailable:', error);
+    } finally {
+      video.srcObject = null;
+      stream?.getTracks().forEach((track) => track.stop());
+      for (const [node, [left, top]] of scroll) node.scrollTo({ left, top, behavior: 'instant' });
+      if (handleConfigured) media.setCaptureHandleConfig({});
+    }
+  }
+
+  async function exportToMarkdown(target) {
     const stamp = exportTime(new Date());
+    const sourceUrl = location.href;
     const entries = [];
     const positions = new Map();
+    const captureSlots = new Map();
     let remaining = 8000000;
     Array.from(target.querySelectorAll(previewSelector)).forEach((frame, index) => {
       const host = frame.closest('web-preview');
@@ -767,18 +846,28 @@ pre,table{display:block;overflow:auto}td,th{padding:.35rem;border:1px solid #888
       const path = `previews/web-preview-${index + 1}.html`;
       const rendered = previewFrame(label, preview.html);
       entries.push([path, offlineHtml(label, rendered, 'body{margin:0}.preview-frame{display:block;border:0;width:100%;height:100vh}')]);
-      // Readers that impose a stricter sandbox leave the fallback link visible.
-      const fallbackStyle = entries.length === 1
-        ? '<style>iframe.gemini-web-preview:not([sandbox~="allow-scripts"]){display:none}</style>\n\n'
-        : '';
-      const inline = `<iframe class="gemini-web-preview" src="${path}" title="${escapeHtml(label.replace(/\s+/g, ' '))}" sandbox="allow-scripts" width="100%" height="600" loading="lazy"></iframe>`;
-      slots.push({ markdown: `${fallbackStyle}${inline}\n\n${mdLink(label, path)}`, html: `<figure class="web-preview"><figcaption>${escapeHtml(label)}</figcaption>${rendered}</figure>` });
+      const slot = { markdown: mdLink(label, path), html: `<figure class="web-preview"><figcaption>${escapeHtml(label)}</figcaption>${rendered}</figure>` };
+      slots.push(slot);
+      captureSlots.set(frame, { slot, path, label });
     });
+    let screenshotBytes = 16 * 1024 * 1024;
+    await capturePreviewScreenshots(captureSlots, (frame, bytes) => {
+      const entry = captureSlots.get(frame);
+      if (!entry || bytes.byteLength > screenshotBytes) return;
+      screenshotBytes -= bytes.byteLength;
+      const imagePath = entry.path.replace(/\.html$/, '.png');
+      entries.push([imagePath, bytes]);
+      entry.slot.markdown = `[!${mdLink(entry.label, imagePath)}](<${entry.path}>)`;
+    });
+    if (location.href !== sourceUrl || !target.isConnected) return;
     const thinking = readThinking(target);
     const zipped = entries.length > 0;
     if (zipped) entries.push(['report.html', archiveReportHtml(target, positions, thinking.html)]);
     const markdown = [htmlToMarkdown(target, positions), thinking.markdown,
       zipped ? '[Open the offline HTML report](report.html)' : '',
+      entries.some(([path]) => path.endsWith('.png'))
+        ? '<style>a[href*="previews/web-preview-"][href$=".html"]{display:inline-block}a[href*="previews/web-preview-"][href$=".html"]>img{pointer-events:none}</style>'
+        : '',
     ].filter(Boolean).join("\n\n");
     const blob = zipped
       ? archive([["report.md", markdown], ...entries], stamp)
